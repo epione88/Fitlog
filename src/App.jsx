@@ -527,101 +527,122 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   })();
 
   const R = 90, SW = 10;
-  const circ        = 2 * Math.PI * R;
-  const arcColor    = isWork ? "#ef6c35" : "#5cb8b2";
+  const circ     = 2 * Math.PI * R;
+  const arcColor = isWork ? "#ef6c35" : "#5cb8b2";
   const isCountdown = remaining <= 10 && remaining > 0 && settings.countdownBeeps;
   const ringColor   = isCountdown && remaining <= 3 ? "#e74c3c" : arcColor;
 
-  // ── Track last phase so we only fire phase-start sound once ──────────────────
-  const lastPhaseRef = useRef(null);
+  // ── Settings ref so interval always reads current values without re-creating ──
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  // ── Phase-start sound — fires when phase actually changes ────────────────────
-  useEffect(() => {
-    if (phase === "done" || phase === lastPhaseRef.current) return;
-    lastPhaseRef.current = phase;
-    if (phase === "work") play("workStart");
-    if (phase === "rest") play("restStart");
-  }, [phase]);
+  const playRef = useRef(play);
+  useEffect(() => { playRef.current = play; }, [play]);
 
-  // ── Countdown interval ───────────────────────────────────────────────────────
+  // ── Single source of truth for timer state inside interval ───────────────────
+  const timerState = useRef({ phase, exIdx, setIdx, duration, paused, showEnd });
   useEffect(() => {
-    if (phase === "done" || paused || showEnd) { clearInterval(intervalRef.current); return; }
-    intervalRef.current = setInterval(() => {
-      setTick(t => {
-        const next = t + 1;
-        if (next >= duration) { clearInterval(intervalRef.current); advance(); return 0; }
-        return next;
-      });
-    }, 1000);
-    return () => clearInterval(intervalRef.current);
-  }, [phase, paused, showEnd, exIdx, setIdx]);
-
-  // ── Countdown sounds — fired by watching `remaining` ────────────────────────
-  const prevRemRef = useRef(remaining);
-  useEffect(() => {
-    if (!settings.countdownBeeps || phase === "done" || paused) return;
-    const rem = remaining;
-    if (rem === prevRemRef.current) return;
-    prevRemRef.current = rem;
-    if (rem > 0 && rem <= 10) {
-      if (rem <= 3) play("countdownFinal");
-      else          play("countdown");
-    }
-    if (rem === 0) play("countdownGo");
-  }, [remaining]);
+    timerState.current = { phase, exIdx, setIdx, duration, paused, showEnd };
+  });
 
   const logRef = useRef(logData);
   useEffect(() => { logRef.current = logData; }, [logData]);
 
-  const advance = useCallback(() => {
-    setTick(0);
-    setPhase(prev => {
-      if (prev === "work") {
-        setLogData(d => d.map((e, ei) => ei !== exIdx ? e : {
-          ...e, sets: e.sets.map((s, si) => si === setIdx ? { ...s, done: true } : s)
-        }));
-        const data     = logRef.current;
-        const setsLeft = data[exIdx].sets.length - setIdx - 1;
-        if (setsLeft > 0) return "rest";
-        const exLeft = data.length - exIdx - 1;
-        if (exLeft > 0) { setExIdx(ei => ei + 1); setSetIdx(0); return "rest"; }
-        play("complete");
-        return "done";
+  // ── Advance to next phase ─────────────────────────────────────────────────────
+  const advancePhase = useCallback((fromPhase, fromExIdx, fromSetIdx, pushHistory) => {
+    if (fromPhase === "work") {
+      // mark set done
+      setLogData(d => d.map((e, ei) => ei !== fromExIdx ? e : {
+        ...e, sets: e.sets.map((s, si) => si !== fromSetIdx ? s : { ...s, done: true })
+      }));
+      const data     = logRef.current;
+      const setsLeft = (data[fromExIdx]?.sets?.length ?? 0) - fromSetIdx - 1;
+      const exLeft   = data.length - fromExIdx - 1;
+      if (setsLeft > 0 || exLeft > 0) {
+        if (pushHistory) historyRef.current.push({ phase: "work", exIdx: fromExIdx, setIdx: fromSetIdx });
+        if (exLeft > 0 && setsLeft <= 0) { setExIdx(fromExIdx + 1); setSetIdx(0); }
+        setTick(0);
+        setPhase("rest");
+        playRef.current("restStart");
+      } else {
+        setTick(0);
+        setPhase("done");
+        playRef.current("complete");
       }
-      if (prev === "rest") {
-        setSetIdx(si => {
-          const next = si + 1;
-          return next < logRef.current[exIdx]?.sets?.length ? next : 0;
-        });
-        return "work";
+    } else if (fromPhase === "rest") {
+      if (pushHistory) historyRef.current.push({ phase: "rest", exIdx: fromExIdx, setIdx: fromSetIdx });
+      const data    = logRef.current;
+      const nextSet = fromSetIdx + 1;
+      if (nextSet < (data[fromExIdx]?.sets?.length ?? 0)) {
+        setSetIdx(nextSet);
       }
-      return prev;
-    });
-  }, [exIdx, setIdx, play]);
+      setTick(0);
+      setPhase("work");
+      playRef.current("workStart");
+    }
+  }, []);
 
+  // ── Single interval — all sound logic lives here ──────────────────────────────
+  useEffect(() => {
+    if (phase === "done" || paused || showEnd) {
+      clearInterval(intervalRef.current);
+      return;
+    }
+    // Fire phase-start sound immediately when effect runs (phase just changed)
+    if (phase === "work") playRef.current("workStart");
+    if (phase === "rest") playRef.current("restStart");
+
+    intervalRef.current = setInterval(() => {
+      setTick(t => {
+        const s         = settingsRef.current;
+        const dur       = timerState.current.duration;
+        const nextTick  = t + 1;
+        const rem       = dur - nextTick;
+
+        // Countdown beeps
+        if (s.countdownBeeps && rem >= 0 && rem <= 10) {
+          if (rem === 0)       playRef.current("countdownGo");
+          else if (rem <= 3)   playRef.current("countdownFinal");
+          else                 playRef.current("countdown");
+        }
+
+        if (nextTick >= dur) {
+          clearInterval(intervalRef.current);
+          const { phase: p, exIdx: ei, setIdx: si } = timerState.current;
+          // Use setTimeout to advance outside the setState updater
+          setTimeout(() => advancePhase(p, ei, si, true), 0);
+          return 0;
+        }
+        return nextTick;
+      });
+    }, 1000);
+
+    return () => clearInterval(intervalRef.current);
+  }, [phase, paused, showEnd, exIdx, setIdx]);
+
+  // ── Skip (manual advance) ─────────────────────────────────────────────────────
   const skipPhase = () => {
-    historyRef.current = [...historyRef.current, { phase, exIdx, setIdx, tick }];
     clearInterval(intervalRef.current);
-    advance();
+    advancePhase(phase, exIdx, setIdx, true);
+    setTick(0);
   };
 
+  // ── Go back ───────────────────────────────────────────────────────────────────
   const goBack = () => {
     const prev = historyRef.current.pop();
     if (!prev) return;
     clearInterval(intervalRef.current);
-    // Reset lastPhaseRef so phase-start sound fires correctly after go-back
-    lastPhaseRef.current = null;
-    // Un-done the set if going back through a work phase
+    // Undo set completion if going back to a work phase
     if (prev.phase === "work") {
       setLogData(d => d.map((e, ei) => ei !== prev.exIdx ? e : {
-        ...e, sets: e.sets.map((s, si) => si === prev.setIdx ? { ...s, done: false } : s)
+        ...e, sets: e.sets.map((s, si) => si !== prev.setIdx ? s : { ...s, done: false })
       }));
     }
-    // Set all state together to avoid stale reads
     setExIdx(prev.exIdx);
     setSetIdx(prev.setIdx);
-    setTick(prev.tick);
+    setTick(0);
     setPhase(prev.phase);
+    // Sound fires via phase useEffect above when phase changes
   };
 
   const updateLog = (ei, si, field, val) =>

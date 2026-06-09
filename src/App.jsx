@@ -33,9 +33,26 @@ async function importAllData(jsonStr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUDIO ENGINE — Web Audio API, no external files needed
+// AUDIO ENGINE — Web Audio API, Safari PWA compatible
 // ═══════════════════════════════════════════════════════════════════════════════
 let _AC = null;
+
+// Must be called inside a user gesture (tap/click) to unlock audio on iOS Safari
+function unlockAudio() {
+  if (!_AC) {
+    _AC = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (_AC.state === "suspended") {
+    _AC.resume();
+  }
+  // Play a silent buffer — this is the iOS Safari unlock trick
+  const buf = _AC.createBuffer(1, 1, 22050);
+  const src = _AC.createBufferSource();
+  src.buffer = buf;
+  src.connect(_AC.destination);
+  src.start(0);
+}
+
 function getAC() {
   if (!_AC) _AC = new (window.AudioContext || window.webkitAudioContext)();
   if (_AC.state === "suspended") _AC.resume();
@@ -180,8 +197,8 @@ function SettingsDrawer({ settings, onChange, onClose }) {
           <Row label="Volume" sub={`${settings.volume}%`}>
             <input type="range" min={10} max={100} step={5} value={settings.volume}
               onChange={e => set("volume", Number(e.target.value))}
-              onMouseUp={() => play("workStart")}
-              onTouchEnd={() => play("workStart")}
+              onMouseUp={() => { unlockAudio(); play("workStart"); }}
+              onTouchEnd={() => { unlockAudio(); play("workStart"); }}
               style={{ width: 130, accentColor: "#ef6c35", cursor: "pointer" }} />
           </Row>
 
@@ -221,7 +238,7 @@ function SettingsDrawer({ settings, onChange, onClose }) {
         <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1.5, marginTop: 20, marginBottom: 8 }}>Test</div>
         <div style={{ display: "flex", gap: 8 }}>
           {[["workStart","Work"], ["restStart","Rest"], ["complete","Done!"]].map(([evt, label]) => (
-            <button key={evt} onClick={() => play(evt)}
+            <button key={evt} onClick={() => { unlockAudio(); play(evt); }}
               style={{ ...btnStyle("rgba(255,255,255,0.08)"), flex: 1, fontSize: 13 }}>
               ▶ {label}
             </button>
@@ -539,9 +556,6 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
 
   const logRef = useRef(logData);
   useEffect(() => { logRef.current = logData; }, [logData]);
-
-  // Fire workStart sound on initial mount
-  useEffect(() => { play("workStart"); }, []);
 
   const advance = useCallback(() => {
     setTick(0);
@@ -876,6 +890,7 @@ function WorkoutTab() {
   }, [!!active]);
 
   const startFromRoutine = (routine) => {
+    unlockAudio(); // unlock iOS Safari audio on this tap
     setActive({ id: uid(), date: today(), name: routine.name, routineId: routine.id, exercises: routine.exercises });
     setView("home");
   };

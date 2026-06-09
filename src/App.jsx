@@ -532,31 +532,43 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   const isCountdown = remaining <= 10 && remaining > 0 && settings.countdownBeeps;
   const ringColor   = isCountdown && remaining <= 3 ? "#e74c3c" : arcColor;
 
+  // ── Track last phase so we only fire phase-start sound once ──────────────────
+  const lastPhaseRef = useRef(null);
+
+  // ── Phase-start sound — fires when phase actually changes ────────────────────
+  useEffect(() => {
+    if (phase === "done" || phase === lastPhaseRef.current) return;
+    lastPhaseRef.current = phase;
+    if (phase === "work") play("workStart");
+    if (phase === "rest") play("restStart");
+  }, [phase]);
+
+  // ── Countdown interval ───────────────────────────────────────────────────────
   useEffect(() => {
     if (phase === "done" || paused || showEnd) { clearInterval(intervalRef.current); return; }
-    // Fire phase-start sound on first tick
-    if (tick === 0) {
-      if (phase === "work") play("workStart");
-      if (phase === "rest") play("restStart");
-    }
     intervalRef.current = setInterval(() => {
       setTick(t => {
         const next = t + 1;
-        const rem  = duration - next;
-        // 10-second countdown: tick every second 10 down to 1, then GO sound at 0
-        if (settings.countdownBeeps) {
-          if (rem > 0 && rem <= 10) {
-            if (rem <= 3) play("countdownFinal"); // faster/higher for last 3
-            else          play("countdown");       // softer tick for 10-4
-          }
-          if (rem === 0) play("countdownGo");      // double beep right as phase ends
-        }
         if (next >= duration) { clearInterval(intervalRef.current); advance(); return 0; }
         return next;
       });
     }, 1000);
     return () => clearInterval(intervalRef.current);
-  }, [phase, paused, showEnd, exIdx, setIdx, tick === 0]);
+  }, [phase, paused, showEnd, exIdx, setIdx]);
+
+  // ── Countdown sounds — fired by watching `remaining` ────────────────────────
+  const prevRemRef = useRef(remaining);
+  useEffect(() => {
+    if (!settings.countdownBeeps || phase === "done" || paused) return;
+    const rem = remaining;
+    if (rem === prevRemRef.current) return;
+    prevRemRef.current = rem;
+    if (rem > 0 && rem <= 10) {
+      if (rem <= 3) play("countdownFinal");
+      else          play("countdown");
+    }
+    if (rem === 0) play("countdownGo");
+  }, [remaining]);
 
   const logRef = useRef(logData);
   useEffect(() => { logRef.current = logData; }, [logData]);
@@ -588,7 +600,6 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   }, [exIdx, setIdx, play]);
 
   const skipPhase = () => {
-    // save state before advancing for go-back
     historyRef.current = [...historyRef.current, { phase, exIdx, setIdx, tick }];
     clearInterval(intervalRef.current);
     advance();
@@ -598,16 +609,19 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
     const prev = historyRef.current.pop();
     if (!prev) return;
     clearInterval(intervalRef.current);
-    setPhase(prev.phase);
-    setExIdx(prev.exIdx);
-    setSetIdx(prev.setIdx);
-    setTick(prev.tick);
-    // un-done the set if we're going back to a work phase
+    // Reset lastPhaseRef so phase-start sound fires correctly after go-back
+    lastPhaseRef.current = null;
+    // Un-done the set if going back through a work phase
     if (prev.phase === "work") {
       setLogData(d => d.map((e, ei) => ei !== prev.exIdx ? e : {
         ...e, sets: e.sets.map((s, si) => si === prev.setIdx ? { ...s, done: false } : s)
       }));
     }
+    // Set all state together to avoid stale reads
+    setExIdx(prev.exIdx);
+    setSetIdx(prev.setIdx);
+    setTick(prev.tick);
+    setPhase(prev.phase);
   };
 
   const updateLog = (ei, si, field, val) =>
@@ -1691,52 +1705,87 @@ const emptyStyle = { textAlign: "center", color: "rgba(255,255,255,0.2)", fontSi
 // BACKUP DRAWER — export / import JSON for Drive backup
 // ═══════════════════════════════════════════════════════════════════════════════
 function BackupDrawer({ onClose }) {
-  const [mode, setMode]       = useState("menu"); // menu | export | import
-  const [json, setJson]       = useState("");
-  const [copied, setCopied]   = useState(false);
-  const [status, setStatus]   = useState("");
+  const [mode, setMode]     = useState("menu");
+  const [json, setJson]     = useState("");
+  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState("");
+  const [summary, setSummary] = useState(null);
 
   const doExport = async () => {
     setMode("export");
     setStatus("Reading data…");
     const data = await exportAllData();
     setJson(data);
+    // Build summary
+    try {
+      const parsed = JSON.parse(data);
+      setSummary({
+        sessions:  (parsed["workout-sessions"] || []).length,
+        routines:  (parsed["workout-routines"] || []).length,
+        mealDays:  Object.keys(parsed).filter(k => k.startsWith("meals-")).length,
+        moveDays:  Object.keys(parsed).filter(k => k.startsWith("movement-")).length,
+        savedAt:   new Date().toLocaleString(),
+      });
+    } catch {}
     setStatus("");
   };
 
   const copyToClipboard = async () => {
-    try { await navigator.clipboard.writeText(json); setCopied(true); setTimeout(() => setCopied(false), 2000); }
-    catch { setCopied(false); }
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 3000);
+    } catch { setCopied(false); }
+  };
+
+  const shareData = async () => {
+    try {
+      await navigator.share({ title: "FitLog Backup", text: json });
+    } catch { copyToClipboard(); }
   };
 
   const doImport = async () => {
     try {
       setStatus("Importing…");
       await importAllData(json);
-      setStatus("Imported ✓ — reload the app to see your data");
+      setStatus("✓ Restored! Pull down to refresh the app.");
     } catch {
-      setStatus("Invalid JSON — check your data and try again");
+      setStatus("Invalid data — make sure you pasted the full backup JSON.");
     }
   };
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 100, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 100, display: "flex", flexDirection: "column", justifyContent: "flex-end" }}
       onClick={e => e.target === e.currentTarget && onClose()}>
-      <div style={{ background: "#1a1218", borderRadius: "20px 20px 0 0", padding: "20px 20px 40px", maxHeight: "80vh", overflowY: "auto" }}>
+      <div style={{ background: "#1a1218", borderRadius: "20px 20px 0 0", padding: "20px 20px 48px", maxHeight: "88vh", overflowY: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-          <div style={{ fontWeight: 800, fontSize: 17 }}>📦 Backup & Restore</div>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>💾 Save & Restore</div>
           <button onClick={onClose} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", fontSize: 22, cursor: "pointer" }}>×</button>
         </div>
 
         {mode === "menu" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 4, lineHeight: 1.6 }}>
-              Export your data as JSON to back up or transfer to another device. Save it to Google Drive, Notes, or anywhere you like.
+            <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>What gets saved</div>
+              {[
+                ["🏋️", "All workout sessions", "weights, reps, volume history"],
+                ["📋", "Your routines", "exercises, timers, base weights"],
+                ["🥗", "Nutrition logs", "meals and macro history"],
+                ["🏃", "Movement data", "steps, calories, activity"],
+              ].map(([icon, title, sub]) => (
+                <div key={title} style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <div style={{ fontSize: 20 }}>{icon}</div>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{title}</div>
+                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>{sub}</div>
+                  </div>
+                </div>
+              ))}
             </div>
-            <button onClick={doExport} style={{ ...btnStyle("#ef6c35"), width: "100%", fontSize: 15 }}>
-              ↑ Export Data
+            <button onClick={doExport} style={{ ...btnStyle("#ef6c35"), width: "100%", fontSize: 15, padding: "13px" }}>
+              ↑ Export / Save Data
             </button>
-            <button onClick={() => setMode("import")} style={{ ...btnStyle("rgba(255,255,255,0.08)"), width: "100%", fontSize: 15 }}>
+            <button onClick={() => setMode("import")} style={{ ...btnStyle("rgba(255,255,255,0.08)"), width: "100%", fontSize: 15, padding: "13px" }}>
               ↓ Import / Restore Data
             </button>
           </div>
@@ -1744,34 +1793,62 @@ function BackupDrawer({ onClose }) {
 
         {mode === "export" && (
           <div>
-            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 12 }}>
-              Copy this JSON and save it somewhere safe — Google Drive, Notes, iCloud, etc.
-            </div>
-            {status && <div style={{ fontSize: 13, color: "#f0b429", marginBottom: 8 }}>{status}</div>}
+            {status && <div style={{ fontSize: 13, color: "#f0b429", marginBottom: 12 }}>{status}</div>}
+            {summary && (
+              <div style={{ ...cardStyle, marginBottom: 14 }}>
+                <div style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginBottom: 8 }}>Backup includes</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  {[
+                    [`${summary.sessions} sessions`, "workout history"],
+                    [`${summary.routines} routines`, "with base weights"],
+                    [`${summary.mealDays} meal days`, "nutrition logs"],
+                    [`${summary.moveDays} activity days`, "movement data"],
+                  ].map(([v, l]) => (
+                    <div key={l} style={{ background: "rgba(255,255,255,0.05)", borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: "#ef6c35" }}>{v}</div>
+                      <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)" }}>{l}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", marginTop: 8 }}>Exported {summary.savedAt}</div>
+              </div>
+            )}
             {json && (
               <>
+                <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 10 }}>
+                  Save this to Google Drive, Notes, iCloud, or email it to yourself.
+                </div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <button onClick={shareData} style={{ ...btnStyle("#ef6c35"), flex: 1, fontSize: 14 }}>
+                    Share / Save…
+                  </button>
+                  <button onClick={copyToClipboard} style={{ ...btnStyle(copied ? "#27ae60" : "rgba(255,255,255,0.1)"), flex: 1, fontSize: 14 }}>
+                    {copied ? "Copied ✓" : "Copy"}
+                  </button>
+                </div>
                 <textarea readOnly value={json}
-                  style={{ ...inputStyle, height: 180, fontSize: 11, fontFamily: "monospace", resize: "none", marginBottom: 10 }} />
-                <button onClick={copyToClipboard} style={{ ...btnStyle(copied ? "#27ae60" : "#ef6c35"), width: "100%" }}>
-                  {copied ? "Copied ✓" : "Copy to Clipboard"}
-                </button>
+                  style={{ ...inputStyle, height: 120, fontSize: 10, fontFamily: "monospace", resize: "none" }} />
               </>
             )}
-            <button onClick={() => setMode("menu")} style={{ ...btnStyle("rgba(255,255,255,0.06)"), width: "100%", marginTop: 8, fontSize: 13 }}>← Back</button>
+            <button onClick={() => setMode("menu")} style={{ ...btnStyle("rgba(255,255,255,0.06)"), width: "100%", marginTop: 10, fontSize: 13 }}>← Back</button>
           </div>
         )}
 
         {mode === "import" && (
           <div>
-            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 12 }}>
-              Paste your previously exported JSON below to restore your data.
+            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginBottom: 12, lineHeight: 1.6 }}>
+              Paste your previously exported backup JSON below. This will restore all your workout sessions, routines, and nutrition data.
             </div>
             <textarea value={json} onChange={e => setJson(e.target.value)}
               placeholder="Paste your backup JSON here…"
-              style={{ ...inputStyle, height: 200, fontSize: 11, fontFamily: "monospace", resize: "none", marginBottom: 10 }} />
-            {status && <div style={{ fontSize: 13, color: status.includes("✓") ? "#27ae60" : "#e74c3c", marginBottom: 8 }}>{status}</div>}
+              style={{ ...inputStyle, height: 220, fontSize: 11, fontFamily: "monospace", resize: "none", marginBottom: 10 }} />
+            {status && (
+              <div style={{ fontSize: 13, color: status.includes("✓") ? "#27ae60" : "#e74c3c", marginBottom: 10, lineHeight: 1.5 }}>
+                {status}
+              </div>
+            )}
             <button onClick={doImport} disabled={!json.trim()}
-              style={{ ...btnStyle(!json.trim() ? "rgba(255,255,255,0.1)" : "#ef6c35"), width: "100%", opacity: !json.trim() ? 0.5 : 1 }}>
+              style={{ ...btnStyle(!json.trim() ? "rgba(255,255,255,0.1)" : "#ef6c35"), width: "100%", fontSize: 15, padding: "13px", opacity: !json.trim() ? 0.5 : 1 }}>
               Restore Data
             </button>
             <button onClick={() => setMode("menu")} style={{ ...btnStyle("rgba(255,255,255,0.06)"), width: "100%", marginTop: 8, fontSize: 13 }}>← Back</button>

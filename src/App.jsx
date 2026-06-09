@@ -33,30 +33,37 @@ async function importAllData(jsonStr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUDIO ENGINE — Web Audio API, Safari PWA compatible
+// AUDIO ENGINE — iOS Safari PWA compatible
 // ═══════════════════════════════════════════════════════════════════════════════
 let _AC = null;
-
-// Must be called inside a user gesture (tap/click) to unlock audio on iOS Safari
-function unlockAudio() {
-  if (!_AC) {
-    _AC = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  if (_AC.state === "suspended") {
-    _AC.resume();
-  }
-  // Play a silent buffer — this is the iOS Safari unlock trick
-  const buf = _AC.createBuffer(1, 1, 22050);
-  const src = _AC.createBufferSource();
-  src.buffer = buf;
-  src.connect(_AC.destination);
-  src.start(0);
-}
 
 function getAC() {
   if (!_AC) _AC = new (window.AudioContext || window.webkitAudioContext)();
   if (_AC.state === "suspended") _AC.resume();
   return _AC;
+}
+
+// iOS Safari requires AudioContext to be created AND a sound played
+// synchronously within the same user-gesture call stack.
+// Call this directly inside onClick handlers before any async work.
+function unlockAudio() {
+  try {
+    // Create context synchronously inside the gesture
+    if (!_AC) _AC = new (window.AudioContext || window.webkitAudioContext)();
+
+    // Resume if suspended
+    if (_AC.state === "suspended") _AC.resume();
+
+    // Play a real (but inaudible) tone — silent buffer alone isn't enough on iOS 17+
+    const osc  = _AC.createOscillator();
+    const gain = _AC.createGain();
+    osc.connect(gain);
+    gain.connect(_AC.destination);
+    gain.gain.setValueAtTime(0.001, _AC.currentTime); // nearly silent
+    osc.frequency.setValueAtTime(440, _AC.currentTime);
+    osc.start(_AC.currentTime);
+    osc.stop(_AC.currentTime + 0.05);
+  } catch(e) { /* ignore */ }
 }
 
 // Core tone player
@@ -1790,6 +1797,14 @@ export default function App() {
   // Load settings from storage on mount
   useEffect(() => {
     local.get("app-settings").then(s => { if (s) setSettings(s); });
+  }, []);
+
+  // Unlock audio on very first tap anywhere — critical for iOS Safari PWA
+  useEffect(() => {
+    const unlock = () => { unlockAudio(); document.removeEventListener("touchstart", unlock); document.removeEventListener("mousedown", unlock); };
+    document.addEventListener("touchstart", unlock, { once: true, passive: true });
+    document.addEventListener("mousedown",  unlock, { once: true });
+    return () => { document.removeEventListener("touchstart", unlock); document.removeEventListener("mousedown", unlock); };
   }, []);
 
   const updateSettings = (newSettings) => {

@@ -501,9 +501,16 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   useEffect(() => { logRef.current = logData; }, [logData]);
 
   const play = useSound(settings);
-  // Always up-to-date refs
-  S.current.settings = settings;
+
+  // Stable refs — always current inside interval without closure staleness
+  const playRef     = useRef(play);
+  const settingsRef = useRef(settings);
+  useEffect(() => { playRef.current     = play;     }, [play]);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  // Keep S.current in sync too
   S.current.play     = play;
+  S.current.settings = settings;
 
   const historyRef = useRef([]);
   const intervalRef = useRef(null);
@@ -518,43 +525,39 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
     setShowEnd(S.current.showEnd);
   };
 
-  // ── Advance phase entirely inside ref-land, then sync ───────────────────────
-  const advanceRef = (pushHistory) => {
-    const { phase, exIdx, setIdx } = S.current;
+  // ── Advance phase — takes explicit params to avoid stale closure ────────────
+  const advanceRef = (fromPhase, fromExIdx, fromSetIdx, pushHistory) => {
     const data = logRef.current;
 
-    if (phase === "work") {
-      // Mark set done
-      setLogData(d => d.map((e, ei) => ei !== exIdx ? e : {
-        ...e, sets: e.sets.map((s, si) => si === setIdx ? { ...s, done: true } : s)
+    if (fromPhase === "work") {
+      setLogData(d => d.map((e, ei) => ei !== fromExIdx ? e : {
+        ...e, sets: e.sets.map((s, si) => si === fromSetIdx ? { ...s, done: true } : s)
       }));
-      if (pushHistory) historyRef.current.push({ phase, exIdx, setIdx });
+      if (pushHistory) historyRef.current.push({ phase: fromPhase, exIdx: fromExIdx, setIdx: fromSetIdx });
 
-      const setsLeft = (data[exIdx]?.sets?.length ?? 0) - setIdx - 1;
-      const exLeft   = data.length - exIdx - 1;
+      const setsLeft = (data[fromExIdx]?.sets?.length ?? 0) - fromSetIdx - 1;
+      const exLeft   = data.length - fromExIdx - 1;
 
       if (setsLeft > 0 || exLeft > 0) {
         if (exLeft > 0 && setsLeft <= 0) {
-          S.current.exIdx  = exIdx + 1;
+          S.current.exIdx  = fromExIdx + 1;
           S.current.setIdx = 0;
         }
         S.current.phase = "rest";
         S.current.tick  = 0;
-        S.current.play("restStart");
       } else {
         S.current.phase = "done";
         S.current.tick  = 0;
-        S.current.play("complete");
+        setTimeout(() => playRef.current("complete"), 50);
       }
-    } else if (phase === "rest") {
-      if (pushHistory) historyRef.current.push({ phase, exIdx, setIdx });
-      const nextSet = setIdx + 1;
+    } else if (fromPhase === "rest") {
+      if (pushHistory) historyRef.current.push({ phase: fromPhase, exIdx: fromExIdx, setIdx: fromSetIdx });
+      const nextSet = fromSetIdx + 1;
       if (nextSet < (data[S.current.exIdx]?.sets?.length ?? 0)) {
         S.current.setIdx = nextSet;
       }
       S.current.phase = "work";
       S.current.tick  = 0;
-      S.current.play("workStart");
     }
     syncState();
   };
@@ -567,45 +570,57 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
     intervalRef.current = setInterval(() => {
       if (S.current.paused || S.current.showEnd || S.current.phase === "done") return;
 
-      const exDef  = session.exercises[S.current.exIdx];
-      const dur    = S.current.phase === "work" ? (exDef?.workSec ?? 60) : (exDef?.restSec ?? 60);
+      const exDef = session.exercises[S.current.exIdx];
+      const dur   = S.current.phase === "work" ? (exDef?.workSec ?? 60) : (exDef?.restSec ?? 60);
       S.current.tick += 1;
-      const rem    = dur - S.current.tick;
+      const rem   = dur - S.current.tick;
 
-      // Countdown sounds
-      if (S.current.settings.countdownBeeps) {
-        if (rem === 0)     S.current.play("countdownGo");
-        else if (rem > 0 && rem <= 3)  S.current.play("countdownFinal");
-        else if (rem > 0 && rem <= 10) S.current.play("countdown");
+      // Countdown sounds — use stable ref, never stale
+      if (settingsRef.current.countdownBeeps) {
+        if      (rem === 0)              playRef.current("countdownGo");
+        else if (rem > 0 && rem <= 3)    playRef.current("countdownFinal");
+        else if (rem > 0 && rem <= 10)   playRef.current("countdown");
       }
 
-      setTick(S.current.tick); // update display
+      setTick(S.current.tick);
 
       if (S.current.tick >= dur) {
         S.current.tick = 0;
-        advanceRef(true);
+        // Call advanceRef outside setState to avoid batching issues
+        const p  = S.current.phase;
+        const ei = S.current.exIdx;
+        const si = S.current.setIdx;
+        clearInterval(intervalRef.current);
+        setTimeout(() => advanceRef(p, ei, si, true), 0);
       }
     }, 1000);
   };
 
   // ── Start interval on mount, play opening sound ──────────────────────────────
   useEffect(() => {
-    S.current.play("workStart");
+    // Small delay so audio context is ready after user gesture
+    setTimeout(() => playRef.current("workStart"), 100);
     startInterval();
     return () => clearInterval(intervalRef.current);
   }, []);
 
   // ── Restart interval when phase/exIdx/setIdx change ─────────────────────────
   useEffect(() => {
-    if (S.current.phase !== "done") startInterval();
+    if (S.current.phase !== "done") {
+      setTimeout(() => playRef.current(S.current.phase === "work" ? "workStart" : "restStart"), 100);
+      startInterval();
+    }
     return () => clearInterval(intervalRef.current);
   }, [phase, exIdx, setIdx]);
 
   // ── Skip ──────────────────────────────────────────────────────────────────────
   const skipPhase = () => {
     clearInterval(intervalRef.current);
+    const p  = S.current.phase;
+    const ei = S.current.exIdx;
+    const si = S.current.setIdx;
     S.current.tick = 0;
-    advanceRef(true);
+    advanceRef(p, ei, si, true);
   };
 
   // ── Go back ───────────────────────────────────────────────────────────────────

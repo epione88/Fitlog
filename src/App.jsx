@@ -468,163 +468,144 @@ function routineTotalSec(exercises) {
 // ═══════════════════════════════════════════════════════════════════════════════
 function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   const settings = useContext(SettingsCtx);
-  const play     = useSound(settings);
-  const [phase, setPhase]   = useState("work");
-  const [tick, setTick]     = useState(0);
-  const [exIdx, setExIdx]   = useState(0);
-  const [setIdx, setSetIdx] = useState(0);
 
-  // Pre-populate weight/reps: history avg → routine base → empty
-  const [logData, setLogData] = useState(() =>
-    session.exercises.map(ex => {
-      const stat      = lastStats?.find(s => s.name === ex.name);
-      const suggested = stat?.rollingAvg != null ? String(stat.rollingAvg)
-                      : stat?.lastAvg    != null ? String(stat.lastAvg)
-                      : ex.baseWeight ? String(ex.baseWeight) : "";
-      const sugReps   = stat?.rollingAvg != null ? "" : (ex.baseReps ? String(ex.baseReps) : "");
-      const nSets     = typeof ex.sets === "number" ? ex.sets : ex.sets?.length ?? 3;
-      return {
-        ...ex,
-        sets: Array.from({ length: nSets }, () => ({ weight: suggested, reps: sugReps, done: false }))
-      };
-    })
-  );
-  const [paused, setPaused]     = useState(false);
-  const [showEnd, setShowEnd]   = useState(false); // end-workout confirm modal
-  const intervalRef             = useRef(null);
-  const historyRef              = useRef([]); // stack of {phase, exIdx, setIdx, tick} for go-back
-
-  const totalRoutineSec = routineTotalSec(session.exercises);
-  const ex        = logData[exIdx];
-  const totalEx   = logData.length;
-  const totalSets = ex?.sets?.length ?? 0;
-  const isWork    = phase === "work";
-  const duration  = isWork
-    ? (session.exercises[exIdx]?.workSec ?? 60)
-    : (session.exercises[exIdx]?.restSec ?? 60);
-  const remaining = duration - tick;
-  const pct       = tick / duration;
-
-  // Per-exercise last-workout stats lookup
-  const exStat = lastStats?.find(s => s.name === ex?.name);
-  // use rollingAvg as the suggested weight (falls back to lastAvg if only 1 session)
-
-  const futureRoutineSec = (() => {
-    let sec = duration - tick;
-    const exDef = session.exercises[exIdx];
-    const workS = exDef?.workSec ?? 60;
-    const restS = exDef?.restSec ?? 60;
-    if (isWork) {
-      sec += restS;
-      sec += (totalSets - setIdx - 1) * (workS + restS);
-    } else {
-      sec += (totalSets - setIdx - 1) * (workS + restS);
-    }
-    for (let i = exIdx + 1; i < session.exercises.length; i++) {
-      sec += routineTotalSec([session.exercises[i]]);
-    }
-    return Math.max(0, sec);
-  })();
-
-  const R = 90, SW = 10;
-  const circ     = 2 * Math.PI * R;
-  const arcColor = isWork ? "#ef6c35" : "#5cb8b2";
-  const isCountdown = remaining <= 10 && remaining > 0 && settings.countdownBeeps;
-  const ringColor   = isCountdown && remaining <= 3 ? "#e74c3c" : arcColor;
-
-  // ── Settings ref so interval always reads current values without re-creating ──
-  const settingsRef = useRef(settings);
-  useEffect(() => { settingsRef.current = settings; }, [settings]);
-
-  const playRef = useRef(play);
-  useEffect(() => { playRef.current = play; }, [play]);
-
-  // ── Single source of truth for timer state inside interval ───────────────────
-  const timerState = useRef({ phase, exIdx, setIdx, duration, paused, showEnd });
-  useEffect(() => {
-    timerState.current = { phase, exIdx, setIdx, duration, paused, showEnd };
+  // ── All timer state lives in ONE ref — the interval reads from it directly ──
+  const S = useRef({
+    phase: "work", exIdx: 0, setIdx: 0, tick: 0,
+    paused: false, showEnd: false,
+    play: null, settings: settings,
   });
 
+  // Mirror to React state only for rendering
+  const [phase,   setPhase]   = useState("work");
+  const [tick,    setTick]    = useState(0);
+  const [exIdx,   setExIdx]   = useState(0);
+  const [setIdx,  setSetIdx]  = useState(0);
+  const [paused,  setPaused]  = useState(false);
+  const [showEnd, setShowEnd] = useState(false);
+
+  const [logData, setLogData] = useState(() =>
+    session.exercises.map(ex => {
+      const stat    = lastStats?.find(s => s.name === ex.name);
+      const w       = stat?.rollingAvg != null ? String(stat.rollingAvg)
+                    : stat?.lastAvg    != null ? String(stat.lastAvg)
+                    : ex.baseWeight ? String(ex.baseWeight) : "";
+      const r       = stat?.rollingAvg != null ? "" : (ex.baseReps ? String(ex.baseReps) : "");
+      const nSets   = typeof ex.sets === "number" ? ex.sets : ex.sets?.length ?? 3;
+      return { ...ex, sets: Array.from({ length: nSets }, () => ({ weight: w, reps: r, done: false })) };
+    })
+  );
+
+  // Keep logData accessible to interval without stale closure
   const logRef = useRef(logData);
   useEffect(() => { logRef.current = logData; }, [logData]);
 
-  // ── Advance to next phase ─────────────────────────────────────────────────────
-  const advancePhase = useCallback((fromPhase, fromExIdx, fromSetIdx, pushHistory) => {
-    if (fromPhase === "work") {
-      // mark set done
-      setLogData(d => d.map((e, ei) => ei !== fromExIdx ? e : {
-        ...e, sets: e.sets.map((s, si) => si !== fromSetIdx ? s : { ...s, done: true })
-      }));
-      const data     = logRef.current;
-      const setsLeft = (data[fromExIdx]?.sets?.length ?? 0) - fromSetIdx - 1;
-      const exLeft   = data.length - fromExIdx - 1;
-      if (setsLeft > 0 || exLeft > 0) {
-        if (pushHistory) historyRef.current.push({ phase: "work", exIdx: fromExIdx, setIdx: fromSetIdx });
-        if (exLeft > 0 && setsLeft <= 0) { setExIdx(fromExIdx + 1); setSetIdx(0); }
-        setTick(0);
-        setPhase("rest");
-        playRef.current("restStart");
-      } else {
-        setTick(0);
-        setPhase("done");
-        playRef.current("complete");
-      }
-    } else if (fromPhase === "rest") {
-      if (pushHistory) historyRef.current.push({ phase: "rest", exIdx: fromExIdx, setIdx: fromSetIdx });
-      const data    = logRef.current;
-      const nextSet = fromSetIdx + 1;
-      if (nextSet < (data[fromExIdx]?.sets?.length ?? 0)) {
-        setSetIdx(nextSet);
-      }
-      setTick(0);
-      setPhase("work");
-      playRef.current("workStart");
-    }
-  }, []);
+  const play = useSound(settings);
+  // Always up-to-date refs
+  S.current.settings = settings;
+  S.current.play     = play;
 
-  // ── Single interval — all sound logic lives here ──────────────────────────────
-  useEffect(() => {
-    if (phase === "done" || paused || showEnd) {
-      clearInterval(intervalRef.current);
-      return;
+  const historyRef = useRef([]);
+  const intervalRef = useRef(null);
+
+  // ── Helper: sync ref → React state for rendering ────────────────────────────
+  const syncState = () => {
+    setPhase(S.current.phase);
+    setTick(S.current.tick);
+    setExIdx(S.current.exIdx);
+    setSetIdx(S.current.setIdx);
+    setPaused(S.current.paused);
+    setShowEnd(S.current.showEnd);
+  };
+
+  // ── Advance phase entirely inside ref-land, then sync ───────────────────────
+  const advanceRef = (pushHistory) => {
+    const { phase, exIdx, setIdx } = S.current;
+    const data = logRef.current;
+
+    if (phase === "work") {
+      // Mark set done
+      setLogData(d => d.map((e, ei) => ei !== exIdx ? e : {
+        ...e, sets: e.sets.map((s, si) => si === setIdx ? { ...s, done: true } : s)
+      }));
+      if (pushHistory) historyRef.current.push({ phase, exIdx, setIdx });
+
+      const setsLeft = (data[exIdx]?.sets?.length ?? 0) - setIdx - 1;
+      const exLeft   = data.length - exIdx - 1;
+
+      if (setsLeft > 0 || exLeft > 0) {
+        if (exLeft > 0 && setsLeft <= 0) {
+          S.current.exIdx  = exIdx + 1;
+          S.current.setIdx = 0;
+        }
+        S.current.phase = "rest";
+        S.current.tick  = 0;
+        S.current.play("restStart");
+      } else {
+        S.current.phase = "done";
+        S.current.tick  = 0;
+        S.current.play("complete");
+      }
+    } else if (phase === "rest") {
+      if (pushHistory) historyRef.current.push({ phase, exIdx, setIdx });
+      const nextSet = setIdx + 1;
+      if (nextSet < (data[S.current.exIdx]?.sets?.length ?? 0)) {
+        S.current.setIdx = nextSet;
+      }
+      S.current.phase = "work";
+      S.current.tick  = 0;
+      S.current.play("workStart");
     }
-    // Fire phase-start sound immediately when effect runs (phase just changed)
-    if (phase === "work") playRef.current("workStart");
-    if (phase === "rest") playRef.current("restStart");
+    syncState();
+  };
+
+  // ── Single interval — reads/writes S.current only ───────────────────────────
+  const startInterval = () => {
+    clearInterval(intervalRef.current);
+    if (S.current.phase === "done") return;
 
     intervalRef.current = setInterval(() => {
-      setTick(t => {
-        const s         = settingsRef.current;
-        const dur       = timerState.current.duration;
-        const nextTick  = t + 1;
-        const rem       = dur - nextTick;
+      if (S.current.paused || S.current.showEnd || S.current.phase === "done") return;
 
-        // Countdown beeps
-        if (s.countdownBeeps && rem >= 0 && rem <= 10) {
-          if (rem === 0)       playRef.current("countdownGo");
-          else if (rem <= 3)   playRef.current("countdownFinal");
-          else                 playRef.current("countdown");
-        }
+      const exDef  = session.exercises[S.current.exIdx];
+      const dur    = S.current.phase === "work" ? (exDef?.workSec ?? 60) : (exDef?.restSec ?? 60);
+      S.current.tick += 1;
+      const rem    = dur - S.current.tick;
 
-        if (nextTick >= dur) {
-          clearInterval(intervalRef.current);
-          const { phase: p, exIdx: ei, setIdx: si } = timerState.current;
-          // Use setTimeout to advance outside the setState updater
-          setTimeout(() => advancePhase(p, ei, si, true), 0);
-          return 0;
-        }
-        return nextTick;
-      });
+      // Countdown sounds
+      if (S.current.settings.countdownBeeps) {
+        if (rem === 0)     S.current.play("countdownGo");
+        else if (rem > 0 && rem <= 3)  S.current.play("countdownFinal");
+        else if (rem > 0 && rem <= 10) S.current.play("countdown");
+      }
+
+      setTick(S.current.tick); // update display
+
+      if (S.current.tick >= dur) {
+        S.current.tick = 0;
+        advanceRef(true);
+      }
     }, 1000);
+  };
 
+  // ── Start interval on mount, play opening sound ──────────────────────────────
+  useEffect(() => {
+    S.current.play("workStart");
+    startInterval();
     return () => clearInterval(intervalRef.current);
-  }, [phase, paused, showEnd, exIdx, setIdx]);
+  }, []);
 
-  // ── Skip (manual advance) ─────────────────────────────────────────────────────
+  // ── Restart interval when phase/exIdx/setIdx change ─────────────────────────
+  useEffect(() => {
+    if (S.current.phase !== "done") startInterval();
+    return () => clearInterval(intervalRef.current);
+  }, [phase, exIdx, setIdx]);
+
+  // ── Skip ──────────────────────────────────────────────────────────────────────
   const skipPhase = () => {
     clearInterval(intervalRef.current);
-    advancePhase(phase, exIdx, setIdx, true);
-    setTick(0);
+    S.current.tick = 0;
+    advanceRef(true);
   };
 
   // ── Go back ───────────────────────────────────────────────────────────────────
@@ -632,17 +613,36 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
     const prev = historyRef.current.pop();
     if (!prev) return;
     clearInterval(intervalRef.current);
-    // Undo set completion if going back to a work phase
+
+    // Undo set completion
     if (prev.phase === "work") {
       setLogData(d => d.map((e, ei) => ei !== prev.exIdx ? e : {
         ...e, sets: e.sets.map((s, si) => si !== prev.setIdx ? s : { ...s, done: false })
       }));
     }
-    setExIdx(prev.exIdx);
-    setSetIdx(prev.setIdx);
-    setTick(0);
-    setPhase(prev.phase);
-    // Sound fires via phase useEffect above when phase changes
+
+    S.current.phase  = prev.phase;
+    S.current.exIdx  = prev.exIdx;
+    S.current.setIdx = prev.setIdx;
+    S.current.tick   = 0;
+    syncState();
+    // Sound + restart via useEffect on phase/exIdx/setIdx change
+  };
+
+  // ── Pause / resume ────────────────────────────────────────────────────────────
+  const togglePause = () => {
+    S.current.paused = !S.current.paused;
+    setPaused(S.current.paused);
+    if (!S.current.paused) startInterval();
+    else clearInterval(intervalRef.current);
+  };
+
+  // ── End workout ───────────────────────────────────────────────────────────────
+  const triggerEnd = () => {
+    S.current.showEnd = true;
+    S.current.paused  = true;
+    clearInterval(intervalRef.current);
+    syncState();
   };
 
   const updateLog = (ei, si, field, val) =>
@@ -653,54 +653,86 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   const totalVolume = (ex) =>
     ex.sets.filter(s => s.done).reduce((sum, s) => sum + (parseFloat(s.weight)||0)*(parseInt(s.reps)||0), 0);
 
-  // ── End workout confirm modal ────────────────────────────────────────────────
+  // ── Derived display values (from React state, safe for render) ───────────────
+  const exDef      = session.exercises[exIdx];
+  const ex         = logData[exIdx];
+  const totalSets  = ex?.sets?.length ?? 0;
+  const isWork     = phase === "work";
+  const duration   = isWork ? (exDef?.workSec ?? 60) : (exDef?.restSec ?? 60);
+  const remaining  = Math.max(0, duration - tick);
+  const pct        = Math.min(tick / duration, 1);
+  const totalRoutineSec = routineTotalSec(session.exercises);
+  const isCountdown = remaining <= 10 && remaining > 0 && settings.countdownBeeps;
+  const arcColor   = isWork ? "#ef6c35" : "#5cb8b2";
+  const ringColor  = isCountdown && remaining <= 3 ? "#e74c3c" : arcColor;
+  const R = 90, SW = 10;
+  const circ = 2 * Math.PI * R;
+  const exStat = lastStats?.find(s => s.name === ex?.name);
+
+  const futureRoutineSec = (() => {
+    let sec = remaining;
+    const workS = exDef?.workSec ?? 60;
+    const restS = exDef?.restSec ?? 60;
+    if (isWork) {
+      sec += restS + (totalSets - setIdx - 1) * (workS + restS);
+    } else {
+      sec += (totalSets - setIdx - 1) * (workS + restS);
+    }
+    for (let i = exIdx + 1; i < session.exercises.length; i++) {
+      sec += routineTotalSec([session.exercises[i]]);
+    }
+    return Math.max(0, sec);
+  })();
+
+  const canGoBack = historyRef.current.length > 0;
+  const nextEx = exIdx + 1 < logData.length ? logData[exIdx + 1]?.name : null;
+
+  // ── End confirm modal ─────────────────────────────────────────────────────────
   if (showEnd) return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 300, gap: 16 }}>
-      <div style={{ fontSize: 32 }}>🛑</div>
-      <div style={{ fontWeight: 800, fontSize: 20, textAlign: "center" }}>End Workout?</div>
-      <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", textAlign: "center" }}>
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:300, gap:16 }}>
+      <div style={{ fontSize:32 }}>🛑</div>
+      <div style={{ fontWeight:800, fontSize:20, textAlign:"center" }}>End Workout?</div>
+      <div style={{ fontSize:13, color:"rgba(255,255,255,0.4)", textAlign:"center" }}>
         {fmt(workoutTimer)} elapsed · {logData.flatMap(e => e.sets.filter(s => s.done)).length} sets completed
       </div>
-      <div style={{ display: "flex", gap: 10, width: "100%" }}>
-        <button onClick={() => setShowEnd(false)}
-          style={{ ...btnStyle("rgba(255,255,255,0.1)"), flex: 1, fontSize: 14 }}>Keep Going</button>
+      <div style={{ display:"flex", gap:10, width:"100%" }}>
+        <button onClick={() => { S.current.showEnd=false; S.current.paused=false; syncState(); startInterval(); }}
+          style={{ ...btnStyle("rgba(255,255,255,0.1)"), flex:1, fontSize:14 }}>Keep Going</button>
         <button onClick={() => { setPhase("done"); setShowEnd(false); }}
-          style={{ ...btnStyle("#27ae60"), flex: 1, fontSize: 14 }}>Save & Finish ✓</button>
+          style={{ ...btnStyle("#27ae60"), flex:1, fontSize:14 }}>Save & Finish ✓</button>
       </div>
       <button onClick={() => onFinish(logData, workoutTimer)}
-        style={{ background: "none", border: "none", color: "#e74c3c", cursor: "pointer", fontSize: 13 }}>
+        style={{ background:"none", border:"none", color:"#e74c3c", cursor:"pointer", fontSize:13 }}>
         Discard Workout
       </button>
     </div>
   );
 
-  // ── Done state ───────────────────────────────────────────────────────────────
+  // ── Done ──────────────────────────────────────────────────────────────────────
   if (phase === "done") return (
     <div>
-      <div style={{ textAlign: "center", padding: "24px 0 16px" }}>
-        <div style={{ fontSize: 40, marginBottom: 8 }}>🏆</div>
-        <div style={{ fontSize: 22, fontWeight: 800 }}>Workout Complete!</div>
-        <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", marginTop: 4 }}>{fmt(workoutTimer)} total time</div>
+      <div style={{ textAlign:"center", padding:"24px 0 16px" }}>
+        <div style={{ fontSize:40, marginBottom:8 }}>🏆</div>
+        <div style={{ fontSize:22, fontWeight:800 }}>Workout Complete!</div>
+        <div style={{ fontSize:13, color:"rgba(255,255,255,0.4)", marginTop:4 }}>{fmt(workoutTimer)} total time</div>
       </div>
       {logData.map((ex, ei) => (
         <div key={ex.id} style={cardStyle}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-            <div style={{ fontWeight: 700 }}>{ex.name}</div>
-            <div style={{ fontSize: 12, color: "#ef6c35" }}>{totalVolume(ex).toLocaleString()} lbs vol</div>
+          <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+            <div style={{ fontWeight:700 }}>{ex.name}</div>
+            <div style={{ fontSize:12, color:"#ef6c35" }}>{totalVolume(ex).toLocaleString()} lbs vol</div>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "28px 1fr 1fr 60px", gap: 6, marginBottom: 6 }}>
-            {["Set","Weight","Reps","Vol"].map((h,i) => <div key={i} style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>{h}</div>)}
+          <div style={{ display:"grid", gridTemplateColumns:"28px 1fr 1fr 60px", gap:6, marginBottom:6 }}>
+            {["Set","Weight","Reps","Vol"].map((h,i) => <div key={i} style={{ fontSize:10, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", letterSpacing:1 }}>{h}</div>)}
           </div>
           {ex.sets.map((s, si) => (
-            <div key={si} style={{ display: "grid", gridTemplateColumns: "28px 1fr 1fr 60px", gap: 6, alignItems: "center", marginBottom: 5 }}>
-              <div style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", fontWeight: 600 }}>{si+1}</div>
-              <input value={s.weight} onChange={e => updateLog(ei, si, "weight", e.target.value)}
-                placeholder="lbs" type="number"
-                style={{ ...inputStyle, padding: "6px 8px", fontSize: 13, textAlign: "center" }} />
-              <input value={s.reps} onChange={e => updateLog(ei, si, "reps", e.target.value)}
-                placeholder="reps" type="number"
-                style={{ ...inputStyle, padding: "6px 8px", fontSize: 13, textAlign: "center" }} />
-              <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textAlign: "center" }}>
+            <div key={si} style={{ display:"grid", gridTemplateColumns:"28px 1fr 1fr 60px", gap:6, alignItems:"center", marginBottom:5 }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,0.4)", fontWeight:600 }}>{si+1}</div>
+              <input value={s.weight} onChange={e => updateLog(ei, si, "weight", e.target.value)} placeholder="lbs" type="number"
+                style={{ ...inputStyle, padding:"6px 8px", fontSize:13, textAlign:"center" }} />
+              <input value={s.reps} onChange={e => updateLog(ei, si, "reps", e.target.value)} placeholder="reps" type="number"
+                style={{ ...inputStyle, padding:"6px 8px", fontSize:13, textAlign:"center" }} />
+              <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", textAlign:"center" }}>
                 {s.weight && s.reps ? (parseFloat(s.weight)*parseInt(s.reps)).toLocaleString() : "—"}
               </div>
             </div>
@@ -708,130 +740,112 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
         </div>
       ))}
       <button onClick={() => onFinish(logData, workoutTimer)}
-        style={{ ...btnStyle("#27ae60"), width: "100%", fontSize: 15, padding: "13px", marginTop: 4 }}>
+        style={{ ...btnStyle("#27ae60"), width:"100%", fontSize:15, padding:"13px", marginTop:4 }}>
         Save Session ✓
       </button>
     </div>
   );
 
-  // ── Active phase ─────────────────────────────────────────────────────────────
-  const nextEx = exIdx + 1 < logData.length ? logData[exIdx + 1]?.name : null;
-  const canGoBack = historyRef.current.length > 0;
-
+  // ── Active phase ──────────────────────────────────────────────────────────────
   return (
     <div>
-      {/* ── Top bar ── */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <div style={{ textAlign: "left" }}>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>Elapsed</div>
-          <div style={{ fontSize: 14, fontFamily: "monospace", fontWeight: 700 }}>{fmt(workoutTimer)}</div>
+      {/* Top bar */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+        <div style={{ textAlign:"left" }}>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", letterSpacing:1 }}>Elapsed</div>
+          <div style={{ fontSize:14, fontFamily:"monospace", fontWeight:700 }}>{fmt(workoutTimer)}</div>
         </div>
-        <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>Remaining</div>
-          <div style={{ fontSize: 14, fontFamily: "monospace", fontWeight: 700, color: "#f0b429" }}>{fmt(futureRoutineSec)}</div>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", letterSpacing:1 }}>Remaining</div>
+          <div style={{ fontSize:14, fontFamily:"monospace", fontWeight:700, color:"#f0b429" }}>{fmt(futureRoutineSec)}</div>
         </div>
-        <button onClick={() => { setPaused(true); setShowEnd(true); }}
-          style={{ ...btnStyle("rgba(231,76,60,0.2)", { fontSize: 12, padding: "6px 12px", color: "#e74c3c" }) }}>
-          End
-        </button>
+        <button onClick={triggerEnd}
+          style={{ ...btnStyle("rgba(231,76,60,0.2)", { fontSize:12, padding:"6px 12px", color:"#e74c3c" }) }}>End</button>
       </div>
 
-      {/* ── Progress bar ── */}
-      <div style={{ height: 3, background: "rgba(255,255,255,0.07)", borderRadius: 2, marginBottom: 16, overflow: "hidden" }}>
-        <div style={{
-          height: "100%", borderRadius: 2,
-          background: "linear-gradient(90deg, #ef6c35, #f0b429)",
-          width: `${Math.max(2, ((totalRoutineSec - futureRoutineSec) / totalRoutineSec) * 100)}%`,
-          transition: "width 1s linear"
-        }} />
+      {/* Progress bar */}
+      <div style={{ height:3, background:"rgba(255,255,255,0.07)", borderRadius:2, marginBottom:16, overflow:"hidden" }}>
+        <div style={{ height:"100%", borderRadius:2, background:"linear-gradient(90deg,#ef6c35,#f0b429)",
+          width:`${Math.max(2,((totalRoutineSec-futureRoutineSec)/totalRoutineSec)*100)}%`,
+          transition:"width 1s linear" }} />
       </div>
 
-      {/* ── Ring timer ── */}
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 12 }}>
-        <div style={{ position: "relative", width: 200, height: 200 }}>
-          <svg width={200} height={200} style={{ transform: "rotate(-90deg)" }}>
+      {/* Ring timer */}
+      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", marginBottom:12 }}>
+        <div style={{ position:"relative", width:200, height:200 }}>
+          <svg width={200} height={200} style={{ transform:"rotate(-90deg)" }}>
             <circle cx={100} cy={100} r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={SW} />
-            <circle cx={100} cy={100} r={R} fill="none" stroke={ringColor} strokeWidth={isCountdown ? SW + 2 : SW}
+            <circle cx={100} cy={100} r={R} fill="none" stroke={ringColor} strokeWidth={isCountdown ? SW+2 : SW}
               strokeDasharray={circ} strokeDashoffset={circ * pct}
-              strokeLinecap="round"
-              style={{ transition: "stroke-dashoffset 0.9s linear, stroke 0.2s, stroke-width 0.2s" }} />
+              strokeLinecap="round" style={{ transition:"stroke-dashoffset 0.9s linear, stroke 0.2s, stroke-width 0.2s" }} />
           </svg>
-          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 2, color: ringColor, fontWeight: 700, marginBottom: 2 }}>
+          <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+            <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:2, color:ringColor, fontWeight:700, marginBottom:2 }}>
               {isWork ? "WORK" : "REST"}
             </div>
-            <div style={{ fontSize: 52, fontWeight: 900, letterSpacing: -2, fontFamily: "monospace", lineHeight: 1, color: isCountdown && remaining <= 3 ? "#e74c3c" : "#fff" }}>
-              {fmt(Math.max(0, remaining))}
+            <div style={{ fontSize:52, fontWeight:900, letterSpacing:-2, fontFamily:"monospace", lineHeight:1,
+              color: isCountdown && remaining <= 3 ? "#e74c3c" : "#fff" }}>
+              {fmt(remaining)}
             </div>
-            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", marginTop: 5 }}>
-              Set {setIdx + 1} / {totalSets}
-            </div>
+            <div style={{ fontSize:12, color:"rgba(255,255,255,0.35)", marginTop:5 }}>Set {setIdx+1} / {totalSets}</div>
           </div>
         </div>
-        <div style={{ textAlign: "center", marginTop: 6 }}>
-          <div style={{ fontSize: 20, fontWeight: 800 }}>{ex?.name}</div>
-          {!isWork && nextEx && (
-            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", marginTop: 3 }}>Up next: {nextEx}</div>
-          )}
+        <div style={{ textAlign:"center", marginTop:6 }}>
+          <div style={{ fontSize:20, fontWeight:800 }}>{ex?.name}</div>
+          {!isWork && nextEx && <div style={{ fontSize:12, color:"rgba(255,255,255,0.35)", marginTop:3 }}>Up next: {nextEx}</div>}
         </div>
       </div>
 
-      {/* ── Set dots ── */}
-      <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 14 }}>
+      {/* Set dots */}
+      <div style={{ display:"flex", justifyContent:"center", gap:8, marginBottom:14 }}>
         {ex?.sets.map((s, i) => (
-          <div key={i} style={{
-            width: 12, height: 12, borderRadius: "50%",
-            background: s.done ? "#27ae60" : i === setIdx ? arcColor : "rgba(255,255,255,0.12)",
-            border: i === setIdx && !s.done ? `2px solid ${arcColor}` : "2px solid transparent",
-            boxShadow: i === setIdx && !s.done ? `0 0 6px ${arcColor}` : "none",
-            transition: "all 0.3s"
-          }} />
+          <div key={i} style={{ width:12, height:12, borderRadius:"50%",
+            background: s.done ? "#27ae60" : i===setIdx ? ringColor : "rgba(255,255,255,0.12)",
+            border: i===setIdx && !s.done ? `2px solid ${ringColor}` : "2px solid transparent",
+            boxShadow: i===setIdx && !s.done ? `0 0 6px ${ringColor}` : "none",
+            transition:"all 0.3s" }} />
         ))}
       </div>
 
-      {/* ── Controls row: Back · Pause · Skip ── */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+      {/* Controls: Back · Pause · Skip */}
+      <div style={{ display:"flex", gap:8, marginBottom:14 }}>
         <button onClick={goBack} disabled={!canGoBack}
-          style={{ ...btnStyle("rgba(255,255,255,0.08)", { fontSize: 13, padding: "10px 14px", opacity: canGoBack ? 1 : 0.3 }) }}>
+          style={{ ...btnStyle("rgba(255,255,255,0.08)", { fontSize:13, padding:"10px 14px", opacity: canGoBack ? 1 : 0.3 }) }}>
           ⏮ Back
         </button>
-        <button onClick={() => setPaused(p => !p)}
-          style={{ ...btnStyle("rgba(255,255,255,0.1)"), flex: 1, fontSize: 15 }}>
+        <button onClick={togglePause}
+          style={{ ...btnStyle("rgba(255,255,255,0.1)"), flex:1, fontSize:15 }}>
           {paused ? "▶ Resume" : "⏸ Pause"}
         </button>
         <button onClick={skipPhase}
-          style={{ ...btnStyle(isWork ? "rgba(239,108,53,0.15)" : "rgba(92,184,178,0.15)", { fontSize: 13, padding: "10px 14px", color: arcColor }) }}>
+          style={{ ...btnStyle(isWork ? "rgba(239,108,53,0.15)" : "rgba(92,184,178,0.15)", { fontSize:13, padding:"10px 14px", color:arcColor }) }}>
           Skip ⏭
         </button>
       </div>
 
-      {/* ── Last workout stats banner ── */}
+      {/* Last session stats */}
       {(() => {
-        const hasStat = exStat?.avg != null;
-        const hasBase = session.exercises[exIdx]?.baseWeight;
+        const hasStat = exStat?.avg != null || exStat?.rollingAvg != null;
+        const hasBase = !hasStat && session.exercises[exIdx]?.baseWeight;
         if (!hasStat && !hasBase) return null;
         return (
-          <div style={{
-            background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)",
-            borderRadius: 10, padding: "8px 12px", marginBottom: 10,
-          }}>
+          <div style={{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:10, padding:"8px 12px", marginBottom:10 }}>
             {hasStat ? (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>
-                  {exStat.sessionCount > 1 ? `${exStat.sessionCount} sessions` : "Last session"}
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", letterSpacing:1 }}>
+                  {(exStat.sessionCount ?? 1) > 1 ? `${exStat.sessionCount} sessions` : "Last session"}
                 </div>
-                <div style={{ display: "flex", gap: 14, fontSize: 12 }}>
-                  <span><span style={{ color: "#5cb8b2", fontWeight: 700 }}>↓</span> <span style={{ color: "rgba(255,255,255,0.7)" }}>{exStat.min} lbs</span></span>
-                  <span><span style={{ color: "#ef6c35", fontWeight: 700 }}>↑</span> <span style={{ color: "rgba(255,255,255,0.7)" }}>{exStat.max} lbs</span></span>
-                  <span><span style={{ color: "#f0b429", fontWeight: 700 }}>≈</span> <span style={{ color: "#f0b429", fontWeight: 700 }}>{exStat.rollingAvg ?? exStat.lastAvg} lbs avg</span></span>
+                <div style={{ display:"flex", gap:14, fontSize:12 }}>
+                  <span><span style={{ color:"#5cb8b2", fontWeight:700 }}>↓</span> <span style={{ color:"rgba(255,255,255,0.7)" }}>{exStat.min} lbs</span></span>
+                  <span><span style={{ color:"#ef6c35", fontWeight:700 }}>↑</span> <span style={{ color:"rgba(255,255,255,0.7)" }}>{exStat.max} lbs</span></span>
+                  <span><span style={{ color:"#f0b429", fontWeight:700 }}>≈</span> <span style={{ color:"#f0b429", fontWeight:700 }}>{exStat.rollingAvg ?? exStat.lastAvg} lbs</span></span>
                 </div>
               </div>
             ) : (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>Base weight</div>
-                <div style={{ fontSize: 13, color: "#f0b429", fontWeight: 700 }}>
-                  {session.exercises[exIdx]?.baseWeight} lbs
-                  {session.exercises[exIdx]?.baseReps ? ` × ${session.exercises[exIdx].baseReps} reps` : ""}
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <div style={{ fontSize:11, color:"rgba(255,255,255,0.3)", textTransform:"uppercase", letterSpacing:1 }}>Base weight</div>
+                <div style={{ fontSize:13, color:"#f0b429", fontWeight:700 }}>
+                  {session.exercises[exIdx]?.baseWeight} lbs{session.exercises[exIdx]?.baseReps ? ` × ${session.exercises[exIdx].baseReps} reps` : ""}
                 </div>
               </div>
             )}
@@ -839,51 +853,43 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
         );
       })()}
 
-      {/* ── Log weight/reps — pre-filled, always editable ── */}
+      {/* Log weight/reps */}
       <div style={cardStyle}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", textTransform: "uppercase", letterSpacing: 1 }}>
-            Log Set {setIdx + 1} · {ex?.name}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+          <div style={{ fontSize:11, color:"rgba(255,255,255,0.35)", textTransform:"uppercase", letterSpacing:1 }}>
+            Log Set {setIdx+1} · {ex?.name}
           </div>
           {(() => {
-            const hasStat = exStat?.avg != null;
-            const hasBase = !hasStat && session.exercises[exIdx]?.baseWeight;
-            if (hasStat) return <div style={{ fontSize: 10, color: "#f0b429" }}>pre-filled from history</div>;
-            if (hasBase) return <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>pre-filled from base</div>;
+            if (exStat?.rollingAvg != null) return <div style={{ fontSize:10, color:"#f0b429" }}>pre-filled from history</div>;
+            if (session.exercises[exIdx]?.baseWeight) return <div style={{ fontSize:10, color:"rgba(255,255,255,0.3)" }}>pre-filled from base</div>;
             return null;
           })()}
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", marginBottom: 4 }}>Weight (lbs)</div>
-            <input value={logData[exIdx]?.sets[setIdx]?.weight || ""}
-              onChange={e => updateLog(exIdx, setIdx, "weight", e.target.value)}
-              type="number"
-              placeholder={exStat?.rollingAvg != null ? String(exStat.rollingAvg) : exStat?.lastAvg != null ? String(exStat.lastAvg) : (session.exercises[exIdx]?.baseWeight ? String(session.exercises[exIdx].baseWeight) : "0")}
-              style={{ ...inputStyle, textAlign: "center", fontSize: 20, fontWeight: 700, padding: "10px" }} />
+        <div style={{ display:"flex", gap:10 }}>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:11, color:"rgba(255,255,255,0.35)", marginBottom:4 }}>Weight (lbs)</div>
+            <input value={logData[exIdx]?.sets[setIdx]?.weight || ""} onChange={e => updateLog(exIdx, setIdx, "weight", e.target.value)}
+              type="number" placeholder={exStat?.rollingAvg != null ? String(exStat.rollingAvg) : exStat?.lastAvg != null ? String(exStat.lastAvg) : (session.exercises[exIdx]?.baseWeight ? String(session.exercises[exIdx].baseWeight) : "0")}
+              style={{ ...inputStyle, textAlign:"center", fontSize:20, fontWeight:700, padding:"10px" }} />
           </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", marginBottom: 4 }}>Reps</div>
-            <input value={logData[exIdx]?.sets[setIdx]?.reps || ""}
-              onChange={e => updateLog(exIdx, setIdx, "reps", e.target.value)}
-              type="number"
-              placeholder={session.exercises[exIdx]?.baseReps ? String(session.exercises[exIdx].baseReps) : "0"}
-              style={{ ...inputStyle, textAlign: "center", fontSize: 20, fontWeight: 700, padding: "10px" }} />
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:11, color:"rgba(255,255,255,0.35)", marginBottom:4 }}>Reps</div>
+            <input value={logData[exIdx]?.sets[setIdx]?.reps || ""} onChange={e => updateLog(exIdx, setIdx, "reps", e.target.value)}
+              type="number" placeholder={session.exercises[exIdx]?.baseReps ? String(session.exercises[exIdx].baseReps) : "0"}
+              style={{ ...inputStyle, textAlign:"center", fontSize:20, fontWeight:700, padding:"10px" }} />
           </div>
         </div>
       </div>
 
-      {/* ── Exercise queue strip ── */}
-      <div style={{ display: "flex", gap: 6, marginTop: 12, overflowX: "auto", paddingBottom: 4 }}>
+      {/* Exercise queue */}
+      <div style={{ display:"flex", gap:6, marginTop:12, overflowX:"auto", paddingBottom:4 }}>
         {logData.map((e, i) => (
-          <div key={e.id} style={{
-            flexShrink: 0, padding: "5px 10px", borderRadius: 8, fontSize: 12,
-            background: i < exIdx ? "rgba(39,174,96,0.15)" : i === exIdx ? "rgba(239,108,53,0.2)" : "rgba(255,255,255,0.05)",
-            color: i < exIdx ? "#27ae60" : i === exIdx ? "#ef6c35" : "rgba(255,255,255,0.3)",
-            border: `1px solid ${i === exIdx ? "rgba(239,108,53,0.3)" : "transparent"}`,
-            fontWeight: i === exIdx ? 700 : 400,
-          }}>
-            {i < exIdx ? "✓ " : ""}{e.name}
+          <div key={e.id} style={{ flexShrink:0, padding:"5px 10px", borderRadius:8, fontSize:12,
+            background: i<exIdx ? "rgba(39,174,96,0.15)" : i===exIdx ? "rgba(239,108,53,0.2)" : "rgba(255,255,255,0.05)",
+            color: i<exIdx ? "#27ae60" : i===exIdx ? "#ef6c35" : "rgba(255,255,255,0.3)",
+            border:`1px solid ${i===exIdx ? "rgba(239,108,53,0.3)" : "transparent"}`,
+            fontWeight: i===exIdx ? 700 : 400 }}>
+            {i<exIdx ? "✓ " : ""}{e.name}
           </div>
         ))}
       </div>
@@ -891,9 +897,7 @@ function TabataSession({ session, workoutTimer, lastStats, onFinish }) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// WORKOUT TAB
-// ═══════════════════════════════════════════════════════════════════════════════
+
 function WorkoutTab() {
   const [sessions, setSessions]         = useState([]);
   const [routines, setRoutines]         = useState([]);
